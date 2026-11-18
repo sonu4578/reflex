@@ -1,0 +1,1 @@
+The dev event-loop blocking warning for an event handler from an installed package now names the package, starts the stack at the handler, and is shown once per process, instead of repeating a long stack with no app location.

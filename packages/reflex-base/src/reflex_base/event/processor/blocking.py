@@ -28,6 +28,9 @@ _LIBRARY_PATHS = tuple({
     for name in ("stdlib", "platstdlib", "purelib", "platlib")
 })
 
+# Handlers outside the app that were already reported, which the app cannot fix.
+_reported_library_handlers: set[str] = set()
+
 
 class EventLoopBlockingMonitor:
     """Report tasks, such as event handlers, that keep the event loop from responding."""
@@ -70,14 +73,15 @@ class EventLoopBlockingMonitor:
             self._thread.join(timeout=1)
             self._thread = None
 
-    def _describe_blocking(self) -> tuple[str, str, str, str] | None:
+    def _describe_blocking(self) -> tuple[str, str, str, str, bool] | None:
         """Describe the task that runs on the blocked loop.
 
         Returns:
             The subject (event handler or task name), the scope note for event
             handlers (or an empty string), the location of the innermost app
-            frame (or an empty string), and the formatted stack of the task, or
-            None if no task runs or the task has left the loop.
+            frame (or an empty string), the formatted stack of the task, and
+            whether the event handler lives outside the app, or None if no task
+            runs or the task has left the loop.
         """
         task = asyncio.current_task(self.loop)
         if task is None or (stack := self._task_stack(task)) is None:
@@ -86,21 +90,41 @@ class EventLoopBlockingMonitor:
         if name.startswith(EVENT_TASK_PREFIX):
             event_name = name[len(EVENT_TASK_PREFIX) :].partition("|")[0]
             registered = self.event_handlers.get(event_name)
-            handler_name = (
-                event_name if registered is None else registered.handler.fn.__qualname__
-            )
-            subject = f"Event handler {handler_name}"
+            fn = None if registered is None else registered.handler.fn
+            subject = f"Event handler {event_name if fn is None else fn.__qualname__}"
             scope = ", including state updates such as computed vars"
         else:
+            fn = None
             subject, scope = f"Task {name!r}", ""
         app_frame = self._app_frame(stack)
-        location = (
-            ""
-            if app_frame is None
-            else f" at {app_frame.filename[len(self._app_root) :]}:"
-            f"{app_frame.lineno} in {app_frame.name}"
+        if app_frame is not None:
+            location = (
+                f" at {app_frame.filename[len(self._app_root) :]}:"
+                f"{app_frame.lineno} in {app_frame.name}"
+            )
+            return (
+                subject,
+                scope,
+                location,
+                "".join(traceback.format_list(stack)),
+                False,
+            )
+        if fn is None:
+            return subject, scope, "", "".join(traceback.format_list(stack)), False
+        # No app code is in the stack: name the package, and skip the frames of
+        # the framework that call the handler.
+        code = fn.__code__
+        for index, frame in enumerate(stack):
+            if frame.filename == code.co_filename and frame.name == code.co_name:
+                stack = stack[index:]
+                break
+        return (
+            f"{subject} (from package {fn.__module__.partition('.')[0]})",
+            scope,
+            "",
+            "".join(traceback.format_list(stack)),
+            True,
         )
-        return subject, scope, location, "".join(traceback.format_list(stack))
 
     def _app_frame(
         self, stack: traceback.StackSummary
@@ -157,6 +181,7 @@ class EventLoopBlockingMonitor:
             # The task is only visible while the loop is blocked, so report it
             # then, and report the total duration once the loop responds.
             subject = None
+            reported = True
             while not responsive.wait(interval):
                 if self._stop.is_set():
                     break
@@ -166,9 +191,16 @@ class EventLoopBlockingMonitor:
                     and elapsed + interval >= self.threshold
                     and (blocking := self._describe_blocking()) is not None
                 ):
-                    subject, scope, location, stack = blocking
+                    subject, scope, location, stack, in_library = blocking
+                    reported = (
+                        not in_library or subject not in _reported_library_handlers
+                    )
+                    if not reported:
+                        continue
+                    if in_library:
+                        _reported_library_handlers.add(subject)
                     logger.warning(
-                        "%s is blocking the event loop%s (threshold: %.3fs)%s. "
+                        "%s is blocking the event loop%s (threshold: %.3fs)%s%s. "
                         "Move blocking I/O to a thread pool or use a non-blocking "
                         "async API.\n"
                         "Blocking stack (most recent call last):\n%s",
@@ -176,11 +208,14 @@ class EventLoopBlockingMonitor:
                         location,
                         self.threshold,
                         scope,
+                        ", with no app code in the stack (reported once per process)"
+                        if in_library
+                        else "",
                         stack.rstrip(),
                     )
             # A stop that lands as the loop responds still gets the total; one
             # that lands while the loop is blocked has no total to report.
-            if subject is not None and responsive.is_set():
+            if subject is not None and reported and responsive.is_set():
                 logger.warning(
                     "%s blocked the event loop for %.3fs in total.",
                     subject,

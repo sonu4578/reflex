@@ -2,11 +2,14 @@
 
 import asyncio
 import logging
+import os
 import re
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable, Coroutine, Generator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -74,11 +77,21 @@ async def _run_monitored(
     fn: Callable[[], Coroutine[Any, Any, None]],
     task_name: str,
     event_handlers: dict[str, RegisteredEventHandler] | None = None,
+    app_root: str | None = None,
 ) -> None:
-    """Run fn in a task with the given name while a monitor watches the loop."""
+    """Run fn in a task with the given name while a monitor watches the loop.
+
+    Args:
+        fn: The coroutine function to run.
+        task_name: The name of the task that runs fn.
+        event_handlers: The registered handlers, by event name.
+        app_root: The app root to give the monitor, instead of the working directory.
+    """
     monitor = EventLoopBlockingMonitor(
         asyncio.get_running_loop(), threshold=0.04, event_handlers=event_handlers or {}
     )
+    if app_root is not None:
+        monitor._app_root = app_root
     monitor.start()
     try:
         await asyncio.create_task(fn(), name=task_name)
@@ -102,6 +115,12 @@ def _blocking(
         time.sleep(duration)  # noqa: ASYNC251
 
     return blocking_handler
+
+
+@pytest.fixture(autouse=True)
+def reset_reported_library_handlers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Forget the library handlers an earlier test reported."""
+    monkeypatch.setattr(blocking, "_reported_library_handlers", set(), raising=False)
 
 
 @pytest.fixture
@@ -325,3 +344,279 @@ async def test_stack_without_task_entry_is_not_reported(
     )
 
     assert description is None
+
+
+def _line_of(code: str) -> int:
+    """Find the line of this file that holds exactly the given code.
+
+    Args:
+        code: The stripped text of the line.
+
+    Returns:
+        The 1-based line number of the first such line.
+    """
+    return next(
+        number
+        for number, line in enumerate(Path(__file__).read_text().splitlines(), 1)
+        if line.strip() == code
+    )
+
+
+_SLEEP_FRAME = (
+    __file__,
+    _line_of("time.sleep(duration)  # noqa: ASYNC251"),
+    "blocking_handler",
+    "time.sleep(duration)  # noqa: ASYNC251",
+)
+
+_HINT = (
+    "Move blocking I/O to a thread pool or use a non-blocking async API.\n"
+    "Blocking stack (most recent call last):\n"
+)
+
+
+def _expected_warning(
+    subject: str, location: str, note: str, frames: list[tuple[str, int, str, str]]
+) -> str:
+    """Build the complete warning the monitor logs when it detects blocking.
+
+    Args:
+        subject: The event handler or task the warning names.
+        location: The app location of the blocking, or an empty string.
+        note: The text after the scope note, or an empty string.
+        frames: The expected frames as filename, line number, name and source line.
+
+    Returns:
+        The full text of the warning.
+    """
+    stack = traceback.format_list([
+        traceback.FrameSummary(filename, lineno, name, line=line)
+        for filename, lineno, name, line in frames
+    ])
+    return (
+        f"{subject} is blocking the event loop{location} (threshold: 0.040s), "
+        f"including state updates such as computed vars{note}. {_HINT}"
+        f"{''.join(stack).rstrip()}"
+    )
+
+
+def _expected_total(subject: str) -> re.Pattern[str]:
+    """Build the pattern of the line that reports the total blocking time.
+
+    Args:
+        subject: The event handler or task the line names.
+
+    Returns:
+        The pattern, with the duration left open.
+    """
+    return re.compile(
+        rf"{re.escape(subject)} blocked the event loop for \d+\.\d{{3}}s in total\."
+    )
+
+
+def _messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the full text of every captured log record.
+
+    Args:
+        caplog: The log capture fixture.
+
+    Returns:
+        The formatted messages, in order.
+    """
+    return [record.getMessage() for record in caplog.records]
+
+
+def _library_handler(
+    probe_queued: threading.Event, module: str = "thirdparty_pkg.handlers"
+) -> tuple[Callable[[], Coroutine[Any, Any, None]], RegisteredEventHandler]:
+    """Create a blocking handler that lives outside the app, in an installed package.
+
+    Args:
+        probe_queued: Set once the monitor queues a responsiveness probe.
+        module: The module the handler claims to be defined in.
+
+    Returns:
+        The handler function and its registration.
+    """
+    handler = _blocking(probe_queued, _BLOCK_SECONDS)
+    handler.__module__ = module
+    return handler, RegisteredEventHandler(handler=EventHandler(fn=handler), states=())
+
+
+_LIBRARY_SUBJECT = (
+    "Event handler _blocking.<locals>.blocking_handler (from package thirdparty_pkg)"
+)
+_LIBRARY_NOTE = ", with no app code in the stack (reported once per process)"
+
+
+async def test_library_handler_names_its_package(
+    caplog_blocking: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Name the package of a handler with no app code in its blocking stack."""
+    probe_queued = _track_queued_probe(asyncio.get_running_loop(), monkeypatch)
+    handler, registered = _library_handler(probe_queued)
+
+    await _run_monitored(
+        handler,
+        f"{EVENT_TASK_PREFIX}state.login|token|txid",
+        {"state.login": registered},
+        app_root=f"{tmp_path}{os.sep}",
+    )
+
+    warning, total = _messages(caplog_blocking)
+    assert warning == _expected_warning(
+        _LIBRARY_SUBJECT, "", _LIBRARY_NOTE, [_SLEEP_FRAME]
+    )
+    assert _expected_total(_LIBRARY_SUBJECT).fullmatch(total)
+
+
+async def test_library_handler_stack_starts_at_the_handler(
+    caplog_blocking: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Leave the frames that call a library handler out of the stack."""
+    probe_queued = _track_queued_probe(asyncio.get_running_loop(), monkeypatch)
+    handler, registered = _library_handler(probe_queued)
+
+    async def framework_wrapper():
+        """Call the handler, as the framework does."""
+        await handler()
+
+    await _run_monitored(
+        framework_wrapper,
+        f"{EVENT_TASK_PREFIX}state.login|token|txid",
+        {"state.login": registered},
+        app_root=f"{tmp_path}{os.sep}",
+    )
+
+    warning, total = _messages(caplog_blocking)
+    assert warning == _expected_warning(
+        _LIBRARY_SUBJECT, "", _LIBRARY_NOTE, [_SLEEP_FRAME]
+    )
+    assert _expected_total(_LIBRARY_SUBJECT).fullmatch(total)
+
+
+async def test_library_handler_is_reported_once_per_process(
+    caplog_blocking: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Report a blocking handler from a package only the first time."""
+    probe_queued = _track_queued_probe(asyncio.get_running_loop(), monkeypatch)
+    handler, registered = _library_handler(probe_queued)
+
+    for _ in range(3):
+        await _run_monitored(
+            handler,
+            f"{EVENT_TASK_PREFIX}state.login|token|txid",
+            {"state.login": registered},
+            app_root=f"{tmp_path}{os.sep}",
+        )
+
+    warning, total = _messages(caplog_blocking)
+    assert warning == _expected_warning(
+        _LIBRARY_SUBJECT, "", _LIBRARY_NOTE, [_SLEEP_FRAME]
+    )
+    assert _expected_total(_LIBRARY_SUBJECT).fullmatch(total)
+    assert len(caplog_blocking.records) == 2
+
+
+async def test_app_handler_is_reported_every_time(
+    caplog_blocking: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+):
+    """Keep reporting a blocking handler defined in the app."""
+    probe_queued = _track_queued_probe(asyncio.get_running_loop(), monkeypatch)
+    handler = _blocking(probe_queued, _BLOCK_SECONDS)
+    registered = RegisteredEventHandler(handler=EventHandler(fn=handler), states=())
+
+    for _ in range(2):
+        await _run_monitored(
+            handler,
+            f"{EVENT_TASK_PREFIX}state.blocking|token|txid",
+            {"state.blocking": registered},
+        )
+
+    subject = "Event handler _blocking.<locals>.blocking_handler"
+    location = (
+        f" at {__file__[len(f'{Path.cwd()}{os.sep}') :]}:{_SLEEP_FRAME[1]}"
+        " in blocking_handler"
+    )
+    expected = _expected_warning(subject, location, "", [_SLEEP_FRAME])
+    first, first_total, second, second_total = _messages(caplog_blocking)
+    assert first == second == expected
+    assert _expected_total(subject).fullmatch(first_total)
+    assert _expected_total(subject).fullmatch(second_total)
+
+
+async def test_unregistered_event_outside_the_app_keeps_the_full_report(
+    caplog_blocking: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Name no package when no handler is registered for the event."""
+    probe_queued = _track_queued_probe(asyncio.get_running_loop(), monkeypatch)
+
+    await _run_monitored(
+        _blocking(probe_queued, _BLOCK_SECONDS),
+        f"{EVENT_TASK_PREFIX}state.unknown|token|txid",
+        app_root=f"{tmp_path}{os.sep}",
+    )
+
+    warning, total = _messages(caplog_blocking)
+    assert warning == _expected_warning(
+        "Event handler state.unknown", "", "", [_SLEEP_FRAME]
+    )
+    assert _expected_total("Event handler state.unknown").fullmatch(total)
+
+
+async def test_library_handler_missing_from_the_stack_keeps_the_full_stack(
+    caplog_blocking: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Keep every frame when the registered handler is not among them."""
+    probe_queued = _track_queued_probe(asyncio.get_running_loop(), monkeypatch)
+    blocking_fn = _blocking(probe_queued, _BLOCK_SECONDS)
+
+    async def registered_handler():
+        """A handler that is registered but not the one that blocks."""
+
+    registered_handler.__module__ = "thirdparty_pkg.handlers"
+    registered = RegisteredEventHandler(
+        handler=EventHandler(fn=registered_handler), states=()
+    )
+
+    async def framework_wrapper():
+        """Block through a function other than the registered handler."""
+        await blocking_fn()
+
+    await _run_monitored(
+        framework_wrapper,
+        f"{EVENT_TASK_PREFIX}state.login|token|txid",
+        {"state.login": registered},
+        app_root=f"{tmp_path}{os.sep}",
+    )
+
+    subject = (
+        "Event handler test_library_handler_missing_from_the_stack_keeps_the_full_stack"
+        ".<locals>.registered_handler (from package thirdparty_pkg)"
+    )
+    warning, total = _messages(caplog_blocking)
+    assert warning == _expected_warning(
+        subject,
+        "",
+        _LIBRARY_NOTE,
+        [
+            (
+                __file__,
+                _line_of("await blocking_fn()"),
+                "framework_wrapper",
+                "await blocking_fn()",
+            ),
+            _SLEEP_FRAME,
+        ],
+    )
+    assert _expected_total(subject).fullmatch(total)
